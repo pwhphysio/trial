@@ -1,1 +1,813 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+OPD Supporting Rotation System
+Scheduling system with auto scheduling and manual editing.
+"""
 
+import json
+import os
+import time as time_mod
+from datetime import datetime
+from flask import Flask, request, jsonify, send_from_directory
+
+app = Flask(__name__, static_folder='static')
+
+# ─── Constants ───────────────────────────────────────────────
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "data.json")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+DAY_LABELS = {
+    "Monday": "Monday", "Tuesday": "Tuesday", "Wednesday": "Wednesday",
+    "Thursday": "Thursday", "Friday": "Friday"
+}
+
+TIME_SLOTS = ["8:30-10:00", "10:00-11:00", "11:00-12:30", "13:30-15:00", "15:00-17:00"]
+MORNING_SLOTS = ["8:30-10:00", "10:00-11:00", "11:00-12:30"]
+AFTERNOON_SLOTS = ["13:30-15:00", "15:00-17:00"]
+
+# Room lists (display order matches the provided image)
+REGULAR_ROOMS = ["Rm 3", "Rm 5", "Rm 7", "Rm 4", "Private"]
+SPORTS_ROOMS = ["Rm 1", "Rm 2", "Rm 6", "Rm 9", "Rm 11"]
+ALL_ROOMS = REGULAR_ROOMS + SPORTS_ROOMS
+
+ROOM_DISPLAY = {
+    "Rm 3": "Rm 3", "Rm 5": "Rm 5", "Rm 7": "Rm 7",
+    "Rm 4": "Rm 4 PAED", "Private": "Private",
+    "Rm 1": "Rm 1", "Rm 2": "Rm 2", "Rm 6": "Rm 6",
+    "Rm 9": "Rm 9", "Rm 11": "Rm 11"
+}
+
+# ─── State ───────────────────────────────────────────────────
+state = {
+    "staff": [],
+    "timetable": {},        # {day: {room: {slot: className}}}
+    "roomPriority": {},     # {room: [staffName, ...]}
+    "roomDefaults": {},     # {room: {staff: [...], count: N}}
+    "privateUsage": {},     # {day: {slot: bool}}
+    "absences": {},         # {dateStr: {staffName: {morning, afternoon, fullday}}}
+    "schedules": {},        # {dateStr: {room: {slot: [staffName, ...]}}}
+    "pcaRatios": {},        # {room: N} e.g. Rm 3: 3 means every 3 therapists need 1 PCA
+    "therapistCounts": {},  # {dateStr: {room: {slot: N}}} therapist count per room/slot
+    "staffCapabilities": {},# {className: [staffName, ...]} who can do which sports class
+    "followUps": {},          # {dateStr: {staffName: "slot1,slot2,..."}} FU unavailable slots
+    "privateUsageByDate": {}, # {dateStr: {slot: bool}} per-date private room usage
+    "noPcaClasses": [],       # [className, ...] classes that don't need PCA
+    "partTimeAttendance": {}, # {dateStr: {staffName: {fullday, morning, afternoon}}} part-time presence
+}
+
+# ─── Persistence ─────────────────────────────────────────────
+def ensure_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+def save_data():
+    ensure_dir()
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return False
+    try:
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+        # Check if it's the new format
+        if "timetable" not in loaded:
+            return False
+        for k in state:
+            if k in loaded:
+                state[k] = loaded[k]
+        return True
+    except Exception:
+        return False
+
+# ─── Default Data ────────────────────────────────────────────
+def init_defaults():
+    """Pre-populate with default staff, timetable, and settings from the provided image."""
+    state["staff"] = [
+        {"id": "s1", "name": "Chris"},
+        {"id": "s2", "name": "JQ"},
+        {"id": "s3", "name": "Wai"},
+        {"id": "s4", "name": "Joanne"},
+        {"id": "s5", "name": "Chak"},
+        {"id": "s6", "name": "Penny"},
+        {"id": "s7", "name": "Yan"},
+        {"id": "s8", "name": "Flora"},
+        {"id": "s9", "name": "Lorraine"},
+        {"id": "s10", "name": "Winnie"},
+        {"id": "s11", "name": "Angel"},
+        {"id": "s12", "name": "Puikei"},
+        {"id": "s13", "name": "Cat"},
+        {"id": "s14", "name": "Anit"},
+        {"id": "s15", "name": "Christy"},
+        {"id": "s16", "name": "Selina"},
+        {"id": "s17", "name": "Dennis", "partTime": True},
+        {"id": "s18", "name": "Anna", "partTime": True},
+        {"id": "s19", "name": "Zoie", "partTime": True},
+        {"id": "s20", "name": "Yuen Kwan", "partTime": True},
+    ]
+
+    state["roomPriority"] = {
+        "Rm 3": ["Chris", "JQ", "Wai", "Joanne", "Chak"],
+        "Rm 5": ["Penny", "Yan", "Flora", "Lorraine", "Winnie"],
+        "Rm 7": ["Angel", "Puikei", "Cat", "Winnie"],
+        "Rm 6": ["Selina"],
+    }
+
+    state["roomDefaults"] = {
+        "Rm 4": {"staff": ["Anit", "Christy"], "count": 2},
+        "Private": {"staff": ["Cat"], "count": 1},
+    }
+
+    state["privateUsage"] = {
+        day: {slot: False for slot in TIME_SLOTS} for day in DAYS
+    }
+
+    state["timetable"] = _build_default_timetable()
+    state["absences"] = {}
+    state["schedules"] = {}
+    state["pcaRatios"] = {"Rm 3": 3, "Rm 5": 2, "Rm 7": 2}
+    state["therapistCounts"] = {}
+    state["staffCapabilities"] = {}
+    state["noPcaClasses"] = []
+    state["partTimeAttendance"] = {}
+    save_data()
+
+
+def _build_default_timetable():
+    """Build weekly timetable from the provided schedule image."""
+    tt = {
+        day: {room: {slot: "" for slot in TIME_SLOTS} for room in SPORTS_ROOMS}
+        for day in DAYS
+    }
+
+    # ── Monday ──
+    m = tt["Monday"]
+    m["Rm 2"]["8:30-10:00"] = "INC"
+    m["Rm 6"]["8:30-10:00"] = "88 HYD"
+    m["Rm 9"]["8:30-10:00"] = "OAK"
+    m["Rm 11"]["8:30-10:00"] = "SNTB"
+    m["Rm 9"]["10:00-11:00"] = "OAK"
+    m["Rm 2"]["11:00-12:30"] = "ONC"
+    m["Rm 6"]["11:00-12:30"] = "67 HYD"
+    m["Rm 9"]["11:00-12:30"] = "SNT"
+    m["Rm 11"]["11:00-12:30"] = "OAK1 New"
+    m["Rm 2"]["13:30-15:00"] = "ABT"
+    m["Rm 6"]["13:30-15:00"] = "86 HBH/FM OAK"
+    m["Rm 9"]["13:30-15:00"] = "GS"
+    m["Rm 11"]["13:30-15:00"] = "OAK1 New"
+    m["Rm 2"]["15:00-17:00"] = "SCOLI"
+    m["Rm 6"]["15:00-17:00"] = "46 HYD"
+    m["Rm 11"]["15:00-17:00"] = "SNTB"
+
+    # ── Tuesday ──
+    t = tt["Tuesday"]
+    t["Rm 2"]["8:30-10:00"] = "SNT2"
+    t["Rm 6"]["8:30-10:00"] = "78 HYD"
+    t["Rm 9"]["8:30-10:00"] = "OAK"
+    t["Rm 2"]["10:00-11:00"] = "SH"
+    t["Rm 6"]["10:00-11:00"] = "SAHK"
+    t["Rm 9"]["10:00-11:00"] = "OAK"
+    t["Rm 2"]["11:00-12:30"] = "SH"
+    t["Rm 6"]["11:00-12:30"] = "Phyd"
+    t["Rm 9"]["11:00-12:30"] = "SNTB"
+    t["Rm 2"]["13:30-15:00"] = "CTS/SDA"
+    t["Rm 6"]["13:30-15:00"] = "87 HYD"
+    t["Rm 9"]["13:30-15:00"] = "Cgym"
+    t["Rm 11"]["13:30-15:00"] = "OAK1 New"
+    t["Rm 2"]["15:00-17:00"] = "Scoli"
+    t["Rm 6"]["15:00-17:00"] = "Heep Hong"
+    t["Rm 9"]["15:00-17:00"] = "CTS/SDA/Bari"
+
+    # ── Wednesday ──
+    w = tt["Wednesday"]
+    w["Rm 2"]["8:30-10:00"] = "ABT"
+    w["Rm 6"]["8:30-10:00"] = "62 HYD"
+    w["Rm 9"]["8:30-10:00"] = "OAK"
+    w["Rm 2"]["10:00-11:00"] = "SNT"
+    w["Rm 6"]["10:00-11:00"] = "63 HYD"
+    w["Rm 9"]["10:00-11:00"] = "SNTI"
+    w["Rm 2"]["11:00-12:30"] = "IO"
+    w["Rm 9"]["11:00-12:30"] = "CTS/SDA"
+    w["Rm 2"]["13:30-15:00"] = "IO"
+    w["Rm 6"]["13:30-15:00"] = "53 HYD"
+    w["Rm 9"]["13:30-15:00"] = "CTS/SDA"
+    w["Rm 11"]["13:30-15:00"] = "ABT"
+    w["Rm 2"]["15:00-17:00"] = "IO"
+    w["Rm 6"]["15:00-17:00"] = "53 HYD"
+    w["Rm 9"]["15:00-17:00"] = "CTS/SDA"
+    w["Rm 11"]["15:00-17:00"] = "NM"
+
+    # ── Thursday ──
+    h = tt["Thursday"]
+    h["Rm 6"]["8:30-10:00"] = "22 HYD"
+    h["Rm 9"]["8:30-10:00"] = "OAK"
+    h["Rm 11"]["8:30-10:00"] = "SNTB"
+    h["Rm 2"]["10:00-11:00"] = "SH"
+    h["Rm 9"]["10:00-11:00"] = "OAK"
+    h["Rm 11"]["10:00-11:00"] = "SNT1 New L"
+    h["Rm 2"]["11:00-12:30"] = "SH"
+    h["Rm 6"]["11:00-12:30"] = "49 SNTH"
+    h["Rm 9"]["11:00-12:30"] = "SNT"
+    h["Rm 11"]["11:00-12:30"] = "SNT1 New"
+    h["Rm 2"]["13:30-15:00"] = "SNT"
+    h["Rm 6"]["13:30-15:00"] = "89 HYD"
+    h["Rm 9"]["13:30-15:00"] = "CTS/SDA"
+    h["Rm 11"]["13:30-15:00"] = "Sacc ENT"
+    h["Rm 2"]["15:00-17:00"] = "SH"
+    h["Rm 6"]["15:00-17:00"] = "Phyd"
+    h["Rm 9"]["15:00-17:00"] = "CTS/SDA"
+    h["Rm 11"]["15:00-17:00"] = "ENT"
+
+    # ── Friday ──
+    f = tt["Friday"]
+    f["Rm 2"]["8:30-10:00"] = "SNT"
+    f["Rm 6"]["8:30-10:00"] = "56 HYD"
+    f["Rm 9"]["8:30-10:00"] = "SNTB"
+    f["Rm 11"]["8:30-10:00"] = "CTS/SDA"
+    f["Rm 2"]["10:00-11:00"] = "SH"
+    f["Rm 9"]["10:00-11:00"] = "SNT"
+    f["Rm 11"]["10:00-11:00"] = "CTS/SDA"
+    f["Rm 2"]["11:00-12:30"] = "SH"
+    f["Rm 6"]["11:00-12:30"] = "40 SNTH"
+    f["Rm 9"]["11:00-12:30"] = "SNT"
+    f["Rm 11"]["11:00-12:30"] = "Cgym/SDA New"
+    f["Rm 2"]["13:30-15:00"] = "IO"
+    f["Rm 6"]["13:30-15:00"] = "42 HYD"
+    f["Rm 9"]["13:30-15:00"] = "SNT"
+    f["Rm 11"]["13:30-15:00"] = "SNT1 New"
+    f["Rm 2"]["15:00-17:00"] = "Scoli"
+    f["Rm 6"]["15:00-17:00"] = "81 HFC"
+    f["Rm 9"]["15:00-17:00"] = "SNTB"
+    f["Rm 11"]["15:00-17:00"] = "Agym"
+
+    return tt
+
+
+# ─── Scheduling Algorithm ────────────────────────────────────
+import math
+
+def auto_schedule(date_str):
+    """
+    Auto-generate a schedule for the given date.
+
+    Priority order:
+    1) Sports rooms: assign 1 capable staff per slot with class (check staffCapabilities).
+       Half-day constraint applies.
+    2) Rm 4 + Private: default staff, substitute from pool if absent.
+    3) Rm 3/5/7: PCA allocation proportional to therapist count.
+       Rm 3: 1 PCA per 3 therapists, Rm 5: 1 PCA per 2, Rm 7: 1 PCA per 2.
+       If not enough remaining staff, distribute proportionally.
+    """
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    day_idx = dt.weekday()
+    if day_idx >= 5:
+        return None  # Weekend
+    day_name = DAYS[day_idx]
+
+    # Separate full-time and part-time staff
+    full_time_staff = [s for s in state["staff"] if not s.get("partTime")]
+    part_time_staff = [s for s in state["staff"] if s.get("partTime")]
+    ft_names = [s["name"] for s in full_time_staff]
+    pt_names = [s["name"] for s in part_time_staff]
+    all_names = ft_names + pt_names
+    # Rotate full-time staff list based on date so assignments are fair across days
+    rotation_offset = dt.timetuple().tm_yday % len(ft_names) if ft_names else 0
+    rotated_names = ft_names[rotation_offset:] + ft_names[:rotation_offset]
+    # Part-time staff only available if marked present
+    pt_attendance = state.get("partTimeAttendance", {}).get(date_str, {})
+    date_abs = state["absences"].get(date_str, {})
+    day_tt = state["timetable"].get(day_name, {})
+    # Per-date private usage takes priority; fall back to weekly default
+    day_priv_by_date = state.get("privateUsageByDate", {}).get(date_str, {})
+    day_priv_weekly = state["privateUsage"].get(day_name, {})
+    day_priv = day_priv_by_date if day_priv_by_date else day_priv_weekly
+    follow_ups = state.get("followUps", {}).get(date_str, {})
+    day_tc = state["therapistCounts"].get(date_str, {})
+    pca_ratios = state.get("pcaRatios", {"Rm 3": 3, "Rm 5": 2, "Rm 7": 2})
+    capabilities = state.get("staffCapabilities", {})
+
+    def available(name, period):
+        # Part-time staff: only available if explicitly marked present
+        if name in pt_names:
+            att = pt_attendance.get(name, {})
+            if att.get("fullday"):
+                return True
+            if period == "morning" and att.get("morning"):
+                return True
+            if period == "afternoon" and att.get("afternoon"):
+                return True
+            return False  # part-time not marked present → not available
+        # Full-time staff: available unless absent
+        ab = date_abs.get(name, {})
+        if ab.get("fullday"):
+            return False
+        if period == "morning" and ab.get("morning"):
+            return False
+        if period == "afternoon" and ab.get("afternoon"):
+            return False
+        return True
+
+    def fu_blocked(name, slot):
+        """Check if staff is blocked by follow-up during this slot."""
+        fu_str = follow_ups.get(name, "")
+        if not fu_str:
+            return False
+        fu_slots = [s.strip() for s in fu_str.split(",") if s.strip()]
+        return slot in fu_slots
+
+    no_pca_classes = state.get("noPcaClasses", [])
+
+    def is_no_pca_class(class_name):
+        """Check if this class doesn't need PCA (e.g. SCOLI, SAHK, Heep Hong)."""
+        upper = class_name.upper()
+        for npc in no_pca_classes:
+            if npc.upper() in upper or upper in npc.upper():
+                return True
+        return False
+
+    def capable_of(name, class_name):
+        """Check if staff is capable of the given sports class."""
+        if not capabilities:
+            return True  # No capability data → anyone can do anything
+        cap_list = capabilities.get(class_name, [])
+        if not cap_list:
+            return True  # No restriction for this class
+        return name in cap_list
+
+    sched = {room: {slot: [] for slot in TIME_SLOTS} for room in ALL_ROOMS}
+    taken = {slot: set() for slot in TIME_SLOTS}
+    sports_am = set()   # staff in sports rooms during morning half
+    sports_pm = set()   # staff in sports rooms during afternoon half
+
+    # ── Phase 1: Sports rooms (highest priority) ──
+    # OAK1 and SNT1 classes require 2 staff members
+    def sports_staff_needed(class_name):
+        upper = class_name.upper()
+        if upper.startswith("OAK1") or upper.startswith("SNT1"):
+            return 2
+        return 1
+
+    # Rm 6 priority list
+    rm6_priority = state["roomPriority"].get("Rm 6", [])
+
+    for slot in TIME_SLOTS:
+        period = "morning" if slot in MORNING_SLOTS else "afternoon"
+        for room in SPORTS_ROOMS:
+            cls = day_tt.get(room, {}).get(slot, "")
+            if not cls:
+                continue
+            # Skip classes that don't need PCA
+            if is_no_pca_class(cls):
+                sched[room][slot] = []
+                continue
+            needed = sports_staff_needed(cls)
+            assigned_sports = []
+
+            # For Rm 6, try priority list first (e.g. Selina)
+            if room == "Rm 6" and rm6_priority:
+                for n in rm6_priority:
+                    if len(assigned_sports) >= needed:
+                        break
+                    if n in taken[slot]:
+                        continue
+                    if not available(n, period):
+                        continue
+                    if fu_blocked(n, slot):
+                        continue
+                    if not capable_of(n, cls):
+                        continue
+                    if period == "morning" and n in sports_pm:
+                        continue
+                    if period == "afternoon" and n in sports_am:
+                        continue
+                    assigned_sports.append(n)
+                    taken[slot].add(n)
+                    if period == "morning":
+                        sports_am.add(n)
+                    else:
+                        sports_pm.add(n)
+
+            # Then fill from rotated pool (includes part-time if present)
+            all_candidates = rotated_names + [n for n in pt_names if n not in rotated_names]
+            for n in all_candidates:
+                if len(assigned_sports) >= needed:
+                    break
+                if n in taken[slot]:
+                    continue
+                if n in assigned_sports:
+                    continue
+                if not available(n, period):
+                    continue
+                if fu_blocked(n, slot):
+                    continue
+                if not capable_of(n, cls):
+                    continue
+                # Half-day constraint
+                if period == "morning" and n in sports_pm:
+                    continue
+                if period == "afternoon" and n in sports_am:
+                    continue
+                assigned_sports.append(n)
+                taken[slot].add(n)
+                if period == "morning":
+                    sports_am.add(n)
+                else:
+                    sports_pm.add(n)
+            sched[room][slot] = assigned_sports
+
+    # ── Phase 2: Rm 4 + Private ──
+    for slot in TIME_SLOTS:
+        period = "morning" if slot in MORNING_SLOTS else "afternoon"
+
+        # Rm 4 (default: Anit, Christy)
+        cfg4 = state["roomDefaults"].get("Rm 4", {"staff": ["Anit", "Christy"], "count": 2})
+        a4 = []
+        for n in cfg4["staff"]:
+            if len(a4) >= cfg4["count"]:
+                break
+            if n in all_names and available(n, period) and n not in taken[slot] and not fu_blocked(n, slot):
+                a4.append(n)
+                taken[slot].add(n)
+        for n in rotated_names:
+            if len(a4) >= cfg4["count"]:
+                break
+            if n not in a4 and available(n, period) and n not in taken[slot] and not fu_blocked(n, slot):
+                a4.append(n)
+                taken[slot].add(n)
+        sched["Rm 4"][slot] = a4
+
+        # Private (default: Cat, only if in-use)
+        if day_priv.get(slot, False):
+            cfgP = state["roomDefaults"].get("Private", {"staff": ["Cat"], "count": 1})
+            aP = []
+            for n in cfgP["staff"]:
+                if len(aP) >= cfgP["count"]:
+                    break
+                if n in all_names and available(n, period) and n not in taken[slot] and not fu_blocked(n, slot):
+                    aP.append(n)
+                    taken[slot].add(n)
+            for n in rotated_names:
+                if len(aP) >= cfgP["count"]:
+                    break
+                if n not in aP and available(n, period) and n not in taken[slot] and not fu_blocked(n, slot):
+                    aP.append(n)
+                    taken[slot].add(n)
+            sched["Private"][slot] = aP
+
+    # ── Phase 3: Rm 3/5/7 - PCA proportional allocation ──
+    for slot in TIME_SLOTS:
+        period = "morning" if slot in MORNING_SLOTS else "afternoon"
+
+        # Calculate ideal PCA count per room
+        pca_needs = {}  # {room: ideal_count}
+        for room in ["Rm 3", "Rm 5", "Rm 7"]:
+            tc = day_tc.get(room, {}).get(slot, 0)
+            ratio = pca_ratios.get(room, 2)
+            if tc > 0 and ratio > 0:
+                pca_needs[room] = math.ceil(tc / ratio)
+            else:
+                pca_needs[room] = 0
+
+        total_needed = sum(pca_needs.values())
+
+        # Count available staff for this slot
+        avail_for_pca = []
+        for n in rotated_names:
+            if n in taken[slot]:
+                continue
+            if not available(n, period):
+                continue
+            if fu_blocked(n, slot):
+                continue
+            avail_for_pca.append(n)
+
+        # If enough staff, allocate as needed; otherwise proportionally reduce
+        if len(avail_for_pca) >= total_needed:
+            alloc = dict(pca_needs)
+        elif total_needed > 0:
+            # Proportional reduction
+            alloc = {}
+            remaining = len(avail_for_pca)
+            for room in ["Rm 3", "Rm 5", "Rm 7"]:
+                share = pca_needs[room] / total_needed * len(avail_for_pca)
+                alloc[room] = int(share)
+            # Distribute rounding remainders
+            allocated_sum = sum(alloc.values())
+            leftover = len(avail_for_pca) - allocated_sum
+            # Give leftovers to rooms with highest fractional part
+            fracs = []
+            for room in ["Rm 3", "Rm 5", "Rm 7"]:
+                share = pca_needs[room] / total_needed * len(avail_for_pca)
+                fracs.append((share - int(share), room))
+            fracs.sort(reverse=True)
+            for _, room in fracs:
+                if leftover <= 0:
+                    break
+                alloc[room] += 1
+                leftover -= 1
+        else:
+            # No therapist counts set → distribute remaining staff evenly
+            if avail_for_pca:
+                base = len(avail_for_pca) // 3
+                extra = len(avail_for_pca) % 3
+                rooms_list = ["Rm 3", "Rm 5", "Rm 7"]
+                alloc = {}
+                for i, room in enumerate(rooms_list):
+                    alloc[room] = base + (1 if i < extra else 0)
+            else:
+                alloc = {room: 0 for room in ["Rm 3", "Rm 5", "Rm 7"]}
+
+        # Assign staff using priority lists first, then general pool
+        avail_set = set(avail_for_pca)
+        for room in ["Rm 3", "Rm 5", "Rm 7"]:
+            count = alloc[room]
+            assigned = []
+            plist = state["roomPriority"].get(room, [])
+            # Rotate priority list by same offset for fairness
+            if plist:
+                p_off = rotation_offset % len(plist)
+                plist = plist[p_off:] + plist[:p_off]
+            # Priority list first
+            for n in plist:
+                if len(assigned) >= count:
+                    break
+                if n in avail_set:
+                    assigned.append(n)
+                    avail_set.discard(n)
+                    taken[slot].add(n)
+            # Fallback to general pool
+            if len(assigned) < count:
+                for n in avail_for_pca:
+                    if len(assigned) >= count:
+                        break
+                    if n in avail_set:
+                        assigned.append(n)
+                        avail_set.discard(n)
+                        taken[slot].add(n)
+            sched[room][slot] = assigned
+
+    # ── Phase 4: Distribute remaining unassigned staff to Rm 3/5/7 ──
+    for slot in TIME_SLOTS:
+        period = "morning" if slot in MORNING_SLOTS else "afternoon"
+        remaining = []
+        for n in rotated_names:
+            if n in taken[slot]:
+                continue
+            if not available(n, period):
+                continue
+            if fu_blocked(n, slot):
+                continue
+            remaining.append(n)
+        if remaining:
+            # Round-robin distribute to Rm 3, Rm 5, Rm 7
+            target_rooms = ["Rm 3", "Rm 5", "Rm 7"]
+            for i, n in enumerate(remaining):
+                room = target_rooms[i % 3]
+                sched[room][slot].append(n)
+                taken[slot].add(n)
+
+    state["schedules"][date_str] = sched
+    save_data()
+    return sched
+
+
+# ─── Routes ──────────────────────────────────────────────────
+@app.route('/')
+def index():
+    return send_from_directory('static', 'index.html')
+
+
+@app.route('/api/data', methods=['GET'])
+def get_all():
+    return jsonify({
+        "staff": state["staff"],
+        "timetable": state["timetable"],
+        "roomPriority": state["roomPriority"],
+        "roomDefaults": state["roomDefaults"],
+        "privateUsage": state["privateUsage"],
+        "pcaRatios": state.get("pcaRatios", {"Rm 3": 3, "Rm 5": 2, "Rm 7": 2}),
+        "staffCapabilities": state.get("staffCapabilities", {}),
+        "noPcaClasses": state.get("noPcaClasses", []),
+        "constants": {
+            "days": DAYS,
+            "dayLabels": DAY_LABELS,
+            "timeSlots": TIME_SLOTS,
+            "morningSlots": MORNING_SLOTS,
+            "afternoonSlots": AFTERNOON_SLOTS,
+            "regularRooms": REGULAR_ROOMS,
+            "sportsRooms": SPORTS_ROOMS,
+            "allRooms": ALL_ROOMS,
+            "roomDisplay": ROOM_DISPLAY,
+        }
+    })
+
+
+# ── Staff ──
+@app.route('/api/staff', methods=['GET', 'POST'])
+def handle_staff_list():
+    if request.method == 'GET':
+        return jsonify(state["staff"])
+    data = request.get_json()
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Name required"}), 400
+    new_s = {"id": f"s{int(time_mod.time()*1000)}", "name": name}
+    if data.get("partTime"):
+        new_s["partTime"] = True
+    state["staff"].append(new_s)
+    save_data()
+    return jsonify(new_s), 201
+
+
+@app.route('/api/staff/<sid>', methods=['PUT', 'DELETE'])
+def handle_staff_item(sid):
+    if request.method == 'DELETE':
+        state["staff"] = [s for s in state["staff"] if s["id"] != sid]
+        save_data()
+        return '', 204
+    data = request.get_json()
+    for s in state["staff"]:
+        if s["id"] == sid:
+            s["name"] = data.get("name", s["name"])
+            break
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Timetable ──
+@app.route('/api/timetable', methods=['GET', 'PUT'])
+def handle_timetable():
+    if request.method == 'GET':
+        return jsonify(state["timetable"])
+    state["timetable"] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Room Priority ──
+@app.route('/api/room-priority', methods=['GET', 'PUT'])
+def handle_priority():
+    if request.method == 'GET':
+        return jsonify(state["roomPriority"])
+    state["roomPriority"] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Room Defaults ──
+@app.route('/api/room-defaults', methods=['GET', 'PUT'])
+def handle_defaults():
+    if request.method == 'GET':
+        return jsonify(state["roomDefaults"])
+    state["roomDefaults"] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Private Usage ──
+@app.route('/api/private-usage', methods=['GET', 'PUT'])
+def handle_private():
+    if request.method == 'GET':
+        return jsonify(state["privateUsage"])
+    state["privateUsage"] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Absences ──
+@app.route('/api/absences/<date>', methods=['GET', 'PUT'])
+def handle_absences(date):
+    if request.method == 'GET':
+        return jsonify(state["absences"].get(date, {}))
+    state["absences"][date] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Follow Ups ──
+@app.route('/api/follow-ups/<date>', methods=['GET', 'PUT'])
+def handle_follow_ups(date):
+    if request.method == 'GET':
+        return jsonify(state.get("followUps", {}).get(date, {}))
+    if "followUps" not in state:
+        state["followUps"] = {}
+    state["followUps"][date] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Private Usage By Date ──
+@app.route('/api/private-usage-by-date/<date>', methods=['GET', 'PUT'])
+def handle_private_usage_by_date(date):
+    if request.method == 'GET':
+        return jsonify(state.get("privateUsageByDate", {}).get(date, {}))
+    if "privateUsageByDate" not in state:
+        state["privateUsageByDate"] = {}
+    state["privateUsageByDate"][date] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Therapist Counts ──
+@app.route('/api/therapist-counts/<date>', methods=['GET', 'PUT'])
+def handle_therapist_counts(date):
+    if request.method == 'GET':
+        return jsonify(state["therapistCounts"].get(date, {}))
+    state["therapistCounts"][date] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Staff Capabilities ──
+@app.route('/api/staff-capabilities', methods=['GET', 'PUT'])
+def handle_capabilities():
+    if request.method == 'GET':
+        return jsonify(state.get("staffCapabilities", {}))
+    state["staffCapabilities"] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── No PCA Classes ──
+@app.route('/api/no-pca-classes', methods=['GET', 'PUT'])
+def handle_no_pca_classes():
+    if request.method == 'GET':
+        return jsonify(state.get("noPcaClasses", []))
+    state["noPcaClasses"] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Part-time Attendance ──
+@app.route('/api/part-time-attendance/<date>', methods=['GET', 'PUT'])
+def handle_part_time_attendance(date):
+    if request.method == 'GET':
+        return jsonify(state.get("partTimeAttendance", {}).get(date, {}))
+    if "partTimeAttendance" not in state:
+        state["partTimeAttendance"] = {}
+    state["partTimeAttendance"][date] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── PCA Ratios ──
+@app.route('/api/pca-ratios', methods=['GET', 'PUT'])
+def handle_pca_ratios():
+    if request.method == 'GET':
+        return jsonify(state.get("pcaRatios", {"Rm 3": 3, "Rm 5": 2, "Rm 7": 2}))
+    state["pcaRatios"] = request.get_json()
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ── Schedule ──
+@app.route('/api/schedule/generate', methods=['POST'])
+def gen_schedule():
+    data = request.get_json()
+    date_str = data.get("date")
+    if not date_str:
+        return jsonify({"error": "Missing date"}), 400
+    try:
+        result = auto_schedule(date_str)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    if result is None:
+        return jsonify({"error": "No scheduling on weekends"}), 400
+    return jsonify(result)
+
+
+@app.route('/api/schedule/<date>', methods=['GET', 'PUT'])
+def handle_schedule(date):
+    if request.method == 'GET':
+        return jsonify(state["schedules"].get(date, {}))
+    data = request.get_json()
+    if date not in state["schedules"]:
+        state["schedules"][date] = {
+            room: {slot: [] for slot in TIME_SLOTS} for room in ALL_ROOMS
+        }
+    room = data.get("room")
+    slot = data.get("slot")
+    staff_list = data.get("staff", [])
+    if room and slot:
+        if room not in state["schedules"][date]:
+            state["schedules"][date][room] = {s: [] for s in TIME_SLOTS}
+        state["schedules"][date][room][slot] = staff_list
+    save_data()
+    return jsonify({"ok": True})
+
+
+# ─── Initialization (runs on import for gunicorn, and on direct run) ───
+os.makedirs('static', exist_ok=True)
+ensure_dir()
+if not load_data():
+    print("Initializing default data...")
+    init_defaults()
+else:
+    print("Loaded existing data.")
+
+# ─── Main ────────────────────────────────────────────────────
+if __name__ == '__main__':
+    print("Server starting on http://localhost:8000")
+    app.run(host='0.0.0.0', port=8000, debug=False)
